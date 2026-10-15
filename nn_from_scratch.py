@@ -27,6 +27,10 @@ class Layer:
         """(parameter, gradient) pairs. Empty for layers without parameters."""
         return []
 
+    def buffers(self) -> list[np.ndarray]:
+        """Non-trainable state that must be saved with the weights (e.g. running stats)."""
+        return []
+
 
 class Dense(Layer):
     """Fully connected layer: y = x @ W + b."""
@@ -107,6 +111,61 @@ class Dropout(Layer):
         return grad if self.mask is None else grad * self.mask
 
 
+class BatchNorm(Layer):
+    """Batch normalisation over the feature axis: y = gamma * x_hat + beta.
+
+    Training uses the mini-batch mean/variance and updates running averages;
+    inference uses the running averages, so predictions don't depend on the batch.
+    """
+
+    def __init__(self, num_features: int, momentum: float = 0.9, eps: float = 1e-5):
+        self.momentum = momentum
+        self.eps = eps
+        self.gamma = np.ones((1, num_features))
+        self.beta = np.zeros((1, num_features))
+        self.dgamma = np.zeros_like(self.gamma)
+        self.dbeta = np.zeros_like(self.beta)
+        self.running_mean = np.zeros((1, num_features))
+        self.running_var = np.ones((1, num_features))
+
+    def forward(self, x, training=True):
+        self.training = training
+        if training:
+            mean = x.mean(axis=0, keepdims=True)
+            var = x.var(axis=0, keepdims=True)
+            self.running_mean *= self.momentum
+            self.running_mean += (1 - self.momentum) * mean
+            self.running_var *= self.momentum
+            self.running_var += (1 - self.momentum) * var
+        else:
+            mean, var = self.running_mean, self.running_var
+        self.inv_std = 1.0 / np.sqrt(var + self.eps)
+        self.x_hat = (x - mean) * self.inv_std
+        return self.gamma * self.x_hat + self.beta
+
+    def backward(self, grad):
+        self.dgamma[...] = (grad * self.x_hat).sum(axis=0, keepdims=True)
+        self.dbeta[...] = grad.sum(axis=0, keepdims=True)
+        dx_hat = grad * self.gamma
+        if not self.training:
+            # Running stats are constants, so the layer is just an affine map.
+            return dx_hat * self.inv_std
+        # Mean and variance depend on every sample in the batch; this is the
+        # standard simplified form of that chain rule.
+        n = grad.shape[0]
+        return (self.inv_std / n) * (
+            n * dx_hat
+            - dx_hat.sum(axis=0, keepdims=True)
+            - self.x_hat * (dx_hat * self.x_hat).sum(axis=0, keepdims=True)
+        )
+
+    def params(self):
+        return [(self.gamma, self.dgamma), (self.beta, self.dbeta)]
+
+    def buffers(self):
+        return [self.running_mean, self.running_var]
+
+
 # ---------------------------------------------------------------------------
 # Loss
 # ---------------------------------------------------------------------------
@@ -159,13 +218,17 @@ class Sequential:
     def num_params(self) -> int:
         return sum(p.size for p, _ in self.params())
 
+    def state(self) -> list[np.ndarray]:
+        """Everything needed to restore the model: parameters, then buffers."""
+        return [p for p, _ in self.params()] + [b for layer in self.layers for b in layer.buffers()]
+
     def save(self, path: str) -> None:
-        np.savez(path, *[p for p, _ in self.params()])
+        np.savez(path, *self.state())
 
     def load(self, path: str) -> None:
         data = np.load(path)
-        for i, (p, _) in enumerate(self.params()):
-            p[...] = data[f"arr_{i}"]
+        for i, arr in enumerate(self.state()):
+            arr[...] = data[f"arr_{i}"]
 
 
 # ---------------------------------------------------------------------------
@@ -285,12 +348,14 @@ def train(model, loss_fn, optimizer, train_data, val_data, epochs, batch_size, r
     return history
 
 
-def gradient_check(model, loss_fn, X, y, rng, eps=1e-5, checks_per_param=10) -> float:
+def gradient_check(model, loss_fn, X, y, rng, eps=1e-5, checks_per_param=10, training=False) -> float:
     """Compare backprop gradients with central finite differences.
 
     Returns the worst relative error; values below ~1e-6 mean backprop is correct.
+    Pass training=True to check train-mode paths (e.g. BatchNorm batch statistics);
+    the model must then be deterministic, so it should contain no Dropout.
     """
-    loss_fn.forward(model.forward(X, training=False), y)
+    loss_fn.forward(model.forward(X, training=training), y)
     model.backward(loss_fn.backward())
 
     worst = 0.0
@@ -300,11 +365,16 @@ def gradient_check(model, loss_fn, X, y, rng, eps=1e-5, checks_per_param=10) -> 
             i = tuple(rng.integers(0, s) for s in p.shape)
             original = p[i]
             p[i] = original + eps
-            loss_plus = loss_fn.forward(model.forward(X, training=False), y)
+            loss_plus = loss_fn.forward(model.forward(X, training=training), y)
             p[i] = original - eps
-            loss_minus = loss_fn.forward(model.forward(X, training=False), y)
+            loss_minus = loss_fn.forward(model.forward(X, training=training), y)
             p[i] = original
             numeric = (loss_plus - loss_minus) / (2 * eps)
+            # Skip gradients that are truly zero (e.g. a bias feeding straight into
+            # BatchNorm): finite-difference rounding noise (~1e-11) divided by ~0
+            # would otherwise be reported as a large relative error.
+            if abs(numeric) < 1e-9 and abs(analytic[i]) < 1e-9:
+                continue
             rel = abs(numeric - analytic[i]) / max(1e-12, abs(numeric) + abs(analytic[i]))
             worst = max(worst, rel)
     return worst
@@ -351,16 +421,15 @@ def plot_results(model, X, y, history, path):
 # Main
 # ---------------------------------------------------------------------------
 
-def build_model(in_features, hidden, n_classes, dropout, rng):
-    return Sequential(
-        Dense(in_features, hidden, rng),
-        ReLU(),
-        Dropout(dropout, rng),
-        Dense(hidden, hidden, rng),
-        ReLU(),
-        Dropout(dropout, rng),
-        Dense(hidden, n_classes, rng, init="xavier"),
-    )
+def build_model(in_features, hidden, n_classes, dropout, rng, batchnorm=False):
+    layers = []
+    for n_in in (in_features, hidden):
+        layers.append(Dense(n_in, hidden, rng))
+        if batchnorm:
+            layers.append(BatchNorm(hidden))
+        layers += [ReLU(), Dropout(dropout, rng)]
+    layers.append(Dense(hidden, n_classes, rng, init="xavier"))
+    return Sequential(*layers)
 
 
 def parse_args():
@@ -372,6 +441,7 @@ def parse_args():
     ap.add_argument("--lr", type=float, default=None, help="default: 1e-2 for adam, 0.1 for sgd")
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--dropout", type=float, default=0.0)
+    ap.add_argument("--batchnorm", action="store_true", help="add BatchNorm after each hidden Dense")
     ap.add_argument("--classes", type=int, default=3)
     ap.add_argument("--samples", type=int, default=300, help="samples per class")
     ap.add_argument("--noise", type=float, default=0.2)
@@ -393,10 +463,11 @@ def main():
         Xg, yg = make_spiral(10, 3, 0.2, rng)
         tiny = Sequential(
             Dense(2, 8, rng, init="xavier"), Tanh(),
-            Dense(8, 8, rng, init="xavier"), Sigmoid(),
+            Dense(8, 8, rng, init="xavier"), BatchNorm(8), Sigmoid(),
             Dense(8, 3, rng, init="xavier"),
         )
-        err = gradient_check(tiny, SoftmaxCrossEntropy(), Xg, yg, rng)
+        # Train mode exercises BatchNorm's batch-statistics backward pass.
+        err = gradient_check(tiny, SoftmaxCrossEntropy(), Xg, yg, rng, training=True)
         status = "OK" if err < 1e-6 else "CHECK YOUR BACKWARD PASS"
         print(f"Gradient check: max relative error = {err:.2e}  [{status}]\n")
 
@@ -407,7 +478,7 @@ def main():
     X_tr, X_va, X_te = (X_tr - mean) / std, (X_va - mean) / std, (X_te - mean) / std
 
     # 3. Model, loss, optimiser.
-    model = build_model(X.shape[1], args.hidden, args.classes, args.dropout, rng)
+    model = build_model(X.shape[1], args.hidden, args.classes, args.dropout, rng, args.batchnorm)
     loss_fn = SoftmaxCrossEntropy()
     if args.optimizer == "adam":
         optimizer = Adam(model.params(), lr=args.lr or 1e-2, weight_decay=args.weight_decay)
