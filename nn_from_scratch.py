@@ -14,6 +14,9 @@ import numpy as np
 # Layers
 # ---------------------------------------------------------------------------
 
+
+
+
 class Layer:
     """Base class. Every layer maps x -> y in forward and dL/dy -> dL/dx in backward."""
 
