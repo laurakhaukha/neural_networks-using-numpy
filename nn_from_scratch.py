@@ -69,6 +69,12 @@ class Dense(Layer):
         return [(self.W, self.dW), (self.b, self.db)]
 
 
+
+
+
+
+
+
 class ReLU(Layer):
     def forward(self, x, training=True):
         self.mask = x > 0
@@ -115,6 +121,12 @@ class Dropout(Layer):
 
     def backward(self, grad):
         return grad if self.mask is None else grad * self.mask
+
+
+
+
+
+
 
 
 class BatchNorm(Layer):
@@ -170,6 +182,11 @@ class BatchNorm(Layer):
 
     def buffers(self):
         return [self.running_mean, self.running_var]
+
+
+
+
+
 
 
 # ---------------------------------------------------------------------------
